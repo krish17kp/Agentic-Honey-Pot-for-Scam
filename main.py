@@ -16,15 +16,11 @@ API_KEY = os.getenv("API_KEY", "SECRET_123")
 
 GUVI_CALLBACK_URL = "https://hackathon.guvi.in/api/updateHoneyPotFinalResult"
 
-# Optional LLM config (fallback replies work without this)
-LLM_API_KEY = os.getenv("LLM_API_KEY", "")
-LLM_URL = "https://api.openai.com/v1/chat/completions"
-
-# Optional Redis
+# Optional Redis (falls back to memory if empty)
 REDIS_URL = os.getenv("REDIS_URL", "")
 
 # ==========================================
-# 2. STATE MANAGEMENT (REDIS + MEMORY)
+# 2. STATE MANAGEMENT (REDIS + MEMORY FALLBACK)
 # ==========================================
 MEMORY_DB = {}
 
@@ -35,8 +31,8 @@ def get_session(session_id: str):
             r = redis.from_url(REDIS_URL, decode_responses=True)
             data = r.get(session_id)
             return json.loads(data) if data else None
-        except:
-            pass
+        except Exception as e:
+            print("STATE: redis get failed:", str(e))
     return MEMORY_DB.get(session_id)
 
 def save_session(session_id: str, data: Dict):
@@ -44,10 +40,10 @@ def save_session(session_id: str, data: Dict):
         try:
             import redis
             r = redis.from_url(REDIS_URL, decode_responses=True)
-            r.setex(session_id, 21600, json.dumps(data))
+            r.setex(session_id, 21600, json.dumps(data))  # 6 hours
             return
-        except:
-            pass
+        except Exception as e:
+            print("STATE: redis set failed:", str(e))
     MEMORY_DB[session_id] = data
 
 def init_session(session_id: str):
@@ -69,57 +65,78 @@ def init_session(session_id: str):
 # ==========================================
 # 3. INTELLIGENCE EXTRACTION
 # ==========================================
+UPI_RE = re.compile(r"[a-zA-Z0-9.\-_]{2,}@[a-zA-Z]{2,}")
+URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
+# Catch bare short links like bit.ly/fakebanksecure (no scheme)
+BARE_DOMAIN_RE = re.compile(r"\b[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(?:/[^\s\]]+)?\b")
+# De-cloaking indian phone numbers like +91 9 8 7 6 5...
+LOOSE_PHONE_RE = re.compile(r"(?:\+?91|0)?[-\s]?(?:\d[-\s]?){10}")
+
+SUSPICIOUS_KEYWORDS = [
+    "urgent", "verify", "blocked", "suspended", "kyc", "otp", "pin", "upi",
+    "collect", "refund", "reward", "lottery", "click", "link", "apk",
+    "anydesk", "teamviewer", "quicksupport", "password", "expire"
+]
+
+def normalize_phone(raw: str) -> str:
+    digits = re.sub(r"\D", "", raw)
+    if len(digits) >= 10:
+        last10 = digits[-10:]
+        if last10 and last10[0] in ["5", "6", "7", "8", "9"]:
+            return last10
+    return ""
+
 def extract_intel(text: str) -> Dict[str, List[str]]:
     text_clean = re.sub(r"\s+", " ", text).strip()
 
-    upis = list(set(re.findall(r"[a-zA-Z0-9.\-_]{2,}@[a-zA-Z]{2,}", text_clean)))
-    links = list(set(re.findall(r"https?://\S+|www\.\S+", text_clean)))
+    upis = set(UPI_RE.findall(text_clean))
 
-    raw_nums = re.findall(r"(?:\+?91|0)?[-\s]?(?:\d[-\s]?){10}", text_clean)
+    urls = set(URL_RE.findall(text_clean))
+    # also catch bare domains if they weren't caught by URL_RE
+    bare = set(BARE_DOMAIN_RE.findall(text_clean))
+    # avoid adding plain words; keep only ones that look link-ish
+    # (this still may catch "SBI.com" etc, which is acceptable for hackathon)
+    urls.update(bare)
+
     phones = set()
-    for n in raw_nums:
-        digits = re.sub(r"\D", "", n)
-        if len(digits) >= 10:
-            last10 = digits[-10:]
-            if last10[0] in ["5", "6", "7", "8", "9"]:
-                phones.add(last10)
+    for p in LOOSE_PHONE_RE.findall(text_clean):
+        n = normalize_phone(p)
+        if n:
+            phones.add(n)
 
-    raw_digits = re.findall(r"\b\d{9,18}\b", text_clean)
-    banks = set()
-    for d in raw_digits:
-        if not any(d in p for p in phones):
-            banks.add(d)
+    # Bank accounts: 9–18 digits (avoid phone numbers)
+    potential_banks = re.findall(r"\b\d{9,18}\b", text_clean)
+    bank_accounts = set()
+    for num in potential_banks:
+        if num not in phones:
+            bank_accounts.add(num)
 
-    keywords = [
-        "urgent", "verify", "blocked", "kyc", "otp", "upi",
-        "account", "click", "apk", "suspended", "reward"
-    ]
-    found_keywords = [k for k in keywords if k in text_clean.lower()]
+    found_keywords = {k for k in SUSPICIOUS_KEYWORDS if k in text_clean.lower()}
 
     return {
-        "upiIds": upis,
-        "bankAccounts": list(banks),
+        "upiIds": list(upis),
+        "bankAccounts": list(bank_accounts),
         "phoneNumbers": list(phones),
-        "phishingLinks": links,
-        "suspiciousKeywords": found_keywords
+        "phishingLinks": list(urls),
+        "suspiciousKeywords": list(found_keywords)
     }
 
 # ==========================================
-# 4. AGENT BRAIN (BAIT & STALL)
+# 4. AGENT REPLIES (SAFE FALLBACK)
 # ==========================================
 FALLBACK_REPLIES = [
-    "I am trying to pay but it says server error. Do you have another option?",
-    "My internet is very slow. Can you send the details again?",
-    "I clicked the link but it did not open. Please resend.",
-    "I am not good with phones. Can you explain step by step?",
-    "Wait, I will ask my son to help me."
+    "I am trying to pay but it says 'Server Error' on my app. Do you have a different ID?",
+    "My internet is very slow. Can you send the bank details via SMS?",
+    "I clicked the link but it says 'Page Not Found'. Send a fresh link.",
+    "I am not tech savvy. Can you explain step by step where to click?",
+    "Wait, let me ask my son to help me with this."
 ]
 
-def generate_reply(text: str) -> str:
+def generate_reply() -> str:
     return random.choice(FALLBACK_REPLIES)
 
 # ==========================================
-# 5. FASTAPI SETUP
+# 5. FASTAPI MODELS
 # ==========================================
 app = FastAPI(title=APP_NAME)
 
@@ -135,31 +152,39 @@ class PayloadModel(BaseModel):
     metadata: Optional[Dict] = None
 
 # ==========================================
-# 6. GUVI CALLBACK
+# 6. MANDATORY GUVI CALLBACK
 # ==========================================
 def send_guvi_callback(payload: Dict):
+    # Very explicit logs so you can verify in Render logs
+    print("GUVI_CALLBACK: sending for sessionId=", payload.get("sessionId"))
+
     try:
-        for _ in range(3):
+        for attempt in range(1, 4):
             r = requests.post(GUVI_CALLBACK_URL, json=payload, timeout=5)
+            print("GUVI_CALLBACK: attempt", attempt, "status=", r.status_code)
+
             if 200 <= r.status_code < 300:
-                print(f"GUVI callback success for {payload['sessionId']}")
-                break
+                print("GUVI_CALLBACK: success for sessionId=", payload.get("sessionId"))
+                return
+
             time.sleep(1)
+
+        print("GUVI_CALLBACK: failed after retries for sessionId=", payload.get("sessionId"))
+
     except Exception as e:
-        print("GUVI callback failed:", str(e))
+        print("GUVI_CALLBACK: exception:", str(e))
 
 # ==========================================
-# 7. HONEYPOT ENDPOINT
+# 7. MAIN ENDPOINT
 # ==========================================
 @app.post("/honeypot")
-def honeypot(
-    req: PayloadModel,
-    background_tasks: BackgroundTasks,
-    x_api_key: str = Header(None)
-):
+def honeypot(req: PayloadModel, background_tasks: BackgroundTasks, x_api_key: str = Header(None)):
+
+    # Auth
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API Key")
 
+    # Load session
     state = get_session(req.sessionId)
     if not state:
         state = init_session(req.sessionId)
@@ -167,66 +192,69 @@ def honeypot(
     state["turns"] += 1
     incoming_text = req.message.text
 
-    # Scam detection
+    # Scam detection trigger
     if not state["scamDetected"]:
-        if any(k in incoming_text.lower() for k in ["blocked", "verify", "otp", "upi", "pay", "link"]):
+        if any(k in incoming_text.lower() for k in ["blocked", "verify", "kyc", "upi", "pay", "link", "otp", "suspend", "suspended"]):
             state["scamDetected"] = True
 
-    # Intelligence extraction
+    # Extract intel
     delta = extract_intel(incoming_text)
-    got_new = False
 
+    got_new_item = False
     for k in state["intel"]:
-        before = set(state["intel"][k])
-        after = set(delta[k])
-        if not after.issubset(before):
-            got_new = True
-        state["intel"][k] = list(before.union(after))
+        existing = set(state["intel"][k])
+        new_items = set(delta[k])
+        if not new_items.issubset(existing):
+            got_new_item = True
+        state["intel"][k] = list(existing.union(new_items))
 
-    if got_new:
+    if got_new_item:
         state["noNewIntelTurns"] = 0
     else:
         state["noNewIntelTurns"] += 1
 
-    # Agent reply
+    # Reply
     if state["scamDetected"]:
-        reply = generate_reply(incoming_text)
+        reply = generate_reply()
     else:
-        reply = "Hello? Who is this?"
+        reply = "Hello? Who is this? I missed a call from this number."
 
     # Stop conditions
     MAX_TURNS = 18
     STALL_LIMIT = 4
 
-    has_data = (
-        len(state["intel"]["upiIds"]) > 0 or
-        len(state["intel"]["bankAccounts"]) > 0 or
-        len(state["intel"]["phishingLinks"]) > 0
+    has_critical_data = (
+        len(state["intel"]["upiIds"]) > 0
+        or len(state["intel"]["bankAccounts"]) > 0
+        or len(state["intel"]["phishingLinks"]) > 0
+        or len(state["intel"]["phoneNumbers"]) > 0
     )
 
-    should_close = (
-        state["turns"] >= MAX_TURNS or
-        (has_data and state["noNewIntelTurns"] >= STALL_LIMIT)
-    )
+    should_close = False
+    if state["turns"] >= MAX_TURNS:
+        should_close = True
+    elif has_critical_data and state["noNewIntelTurns"] >= STALL_LIMIT:
+        should_close = True
 
+    # Mandatory callback (send once)
     if should_close and not state["callbackSent"]:
         final_payload = {
             "sessionId": req.sessionId,
             "scamDetected": True,
             "totalMessagesExchanged": state["turns"],
             "extractedIntelligence": state["intel"],
-            "agentNotes": "Scammer used urgency, impersonation, and payment redirection tactics"
+            "agentNotes": "Scammer used urgency and credential/payment redirection tactics."
         }
+
         background_tasks.add_task(send_guvi_callback, final_payload)
         state["callbackSent"] = True
-        reply = "Network error. Connection lost."
+
+        # End chat message (fake failure)
+        reply = "Network Error. Connection Lost."
 
     save_session(req.sessionId, state)
     return {"status": "success", "reply": reply}
 
-# ==========================================
-# 8. HEALTH CHECK
-# ==========================================
 @app.get("/health")
 def health():
     return {"status": "online"}
